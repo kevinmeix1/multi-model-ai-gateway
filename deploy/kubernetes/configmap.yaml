@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aegis-config
+data:
+  AEGIS_DATABASE_PATH: /var/lib/aegis/aegis.db
+  AEGIS_MODEL_CATALOG_PATH: /app/configs/models.yaml
+  AEGIS_LOG_LEVEL: INFO
+  AEGIS_REQUEST_RATE_PER_SECOND: "20"
+  AEGIS_REQUEST_BURST: "100"

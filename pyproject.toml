@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aegis-ai-gateway"
+version = "0.1.0"
+description = "Policy-first multi-model AI gateway and evaluation control plane"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Kevin Mei" }]
+dependencies = [
+  "aiosqlite>=0.20,<1",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "jsonschema>=4.23,<5",
+  "prometheus-client>=0.21,<1",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "PyYAML>=6.0,<7",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.14,<2",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "pytest-cov>=6,<7",
+  "ruff>=0.9,<1",
+  "types-jsonschema>=4.23,<5",
+  "types-PyYAML>=6.0,<7",
+]
+
+[project.scripts]
+aegis = "aegis_gateway.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aegis_gateway"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers --strict-config"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "RUF", "S"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = ["S603"]
+"tests/*.py" = ["S105", "S106"]
+"src/aegis_gateway/api/app.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["aegis_gateway"]
+plugins = ["pydantic.mypy"]
+warn_unused_configs = true
+
+[tool.coverage.run]
+branch = true
+source = ["aegis_gateway"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 85

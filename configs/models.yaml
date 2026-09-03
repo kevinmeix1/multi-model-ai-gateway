@@ -1,0 +1,65 @@
+routes:
+  - id: mock-primary
+    provider: mock
+    model: deterministic-v1
+    capabilities: [text, streaming, structured_output]
+    regions: [local]
+    context_window: 32768
+    input_cost_per_million: 0.0
+    output_cost_per_million: 0.0
+    expected_p95_latency_ms: 25
+    quality_score: 0.72
+    privacy_modes: [standard, zero_retention, local_only]
+    enabled: true
+
+  - id: mock-canary
+    provider: mock
+    model: deterministic-v2
+    capabilities: [text, streaming, structured_output]
+    regions: [local]
+    context_window: 32768
+    input_cost_per_million: 0.0
+    output_cost_per_million: 0.0
+    expected_p95_latency_ms: 35
+    quality_score: 0.70
+    privacy_modes: [standard, zero_retention, local_only]
+    enabled: true
+
+  - id: openai-balanced
+    provider: openai
+    model: gpt-5.2
+    capabilities: [text, streaming, structured_output, vision, tools]
+    regions: [global]
+    context_window: 128000
+    input_cost_per_million: 1.75
+    output_cost_per_million: 14.0
+    expected_p95_latency_ms: 2400
+    quality_score: 0.94
+    privacy_modes: [standard, zero_retention]
+    enabled: false
+
+  - id: anthropic-balanced
+    provider: anthropic
+    model: claude-sonnet-4-5
+    capabilities: [text, streaming, structured_output, vision, tools]
+    regions: [global]
+    context_window: 200000
+    input_cost_per_million: 3.0
+    output_cost_per_million: 15.0
+    expected_p95_latency_ms: 2600
+    quality_score: 0.93
+    privacy_modes: [standard]
+    enabled: false
+
+  - id: ollama-local
+    provider: ollama
+    model: qwen3:8b
+    capabilities: [text, streaming, structured_output, tools]
+    regions: [local]
+    context_window: 32768
+    input_cost_per_million: 0.0
+    output_cost_per_million: 0.0
+    expected_p95_latency_ms: 5000
+    quality_score: 0.78
+    privacy_modes: [standard, zero_retention, local_only]
+    enabled: false

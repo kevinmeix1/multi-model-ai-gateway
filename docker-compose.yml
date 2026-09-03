@@ -1,0 +1,24 @@
+services:
+  gateway:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      AEGIS_DATABASE_PATH: /app/data/aegis.db
+      AEGIS_MODEL_CATALOG_PATH: /app/configs/models.yaml
+      AEGIS_OLLAMA_BASE_URL: http://ollama:11434
+      AEGIS_ADMIN_TOKEN: ${AEGIS_ADMIN_TOKEN:-development-only}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - aegis-data:/app/data
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["local-model"]
+    volumes:
+      - ollama-data:/root/.ollama
+
+volumes:
+  aegis-data:
+  ollama-data:
