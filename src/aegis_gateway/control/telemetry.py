@@ -99,6 +99,10 @@ class Telemetry:
     def render_prometheus(self) -> bytes:
         return generate_latest(self.registry)
 
+    def set_circuit_state(self, route_id: str, state: str) -> None:
+        encoded = {"closed": 0, "half_open": 1, "open": 2}[state]
+        self.circuit_state.labels(route=route_id).set(encoded)
+
     def event(self, event: str, **attributes: Any) -> None:
         safe = {key: value for key, value in attributes.items() if "key" not in key.casefold()}
         self._logger.info(json.dumps({"event": event, **safe}, default=str, sort_keys=True))

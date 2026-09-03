@@ -28,16 +28,20 @@ from aegis_gateway.domain import (
     GatewayUsage,
     Message,
     ModelRoute,
+    ProviderStreamEvent,
     RequestMetric,
+    RoutingCandidate,
     RoutingDecision,
 )
 from aegis_gateway.errors import (
     AegisError,
+    CircuitOpenError,
     ProviderError,
+    ProviderTimeoutError,
     SchemaViolationError,
     StreamInterruptedError,
 )
-from aegis_gateway.providers.base import ProviderRegistry
+from aegis_gateway.providers.base import ProviderAdapter, ProviderRegistry
 
 _VARIABLE = re.compile(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
 
@@ -74,15 +78,23 @@ class GatewayService:
         shadow: bool = False,
         assignment_override: ReleaseAssignment | None = None,
     ) -> GatewayResponse:
-        request = await self._resolve_prompt(request)
         started = monotonic()
+        request = await self._resolve_prompt(request)
         if not evaluation and not shadow:
             await self.limiter.consume(request.tenant_id)
+
+        if assignment_override is not None:
+            assignment = assignment_override
+        elif evaluation or shadow or forced_route_id is not None:
+            assignment = ReleaseAssignment()
+        else:
+            assignment = await self.releases.assignment(request)
+        cache_namespace = _cache_namespace(assignment, forced_route_id)
+        cache_allowed = not evaluation and not shadow and not assignment.canary
         if (
-            not evaluation
-            and not shadow
+            cache_allowed
             and request.cache_mode is CacheMode.DEFAULT
-            and (cached := await self.cache.get(request)) is not None
+            and (cached := await self.cache.get(request, namespace=cache_namespace)) is not None
         ):
             elapsed = (monotonic() - started) * 1000
             cached = cached.model_copy(
@@ -98,17 +110,12 @@ class GatewayService:
             await self._record_response(
                 request=request,
                 response=cached,
-                assignment=ReleaseAssignment(),
+                assignment=assignment,
                 shadow=False,
             )
+            self._launch_post_response(request, assignment, shadow=False)
             return cached
 
-        if assignment_override is not None:
-            assignment = assignment_override
-        elif evaluation or shadow or forced_route_id is not None:
-            assignment = ReleaseAssignment()
-        else:
-            assignment = await self.releases.assignment(request)
         decision = await self.router.decide(
             request,
             preferred_route_id=assignment.preferred_route_id,
@@ -119,14 +126,33 @@ class GatewayService:
         ordered = _ordered_candidates(decision)
         fallback_count = 0
         last_error: AegisError | None = None
+        last_error_route: ModelRoute | None = None
 
         for candidate in ordered:
             route = self.router.get_route(candidate.route_id)
             try:
-                await self.circuits.before_request(route.id)
-                result = await self.providers.get(route.provider).complete(request, route)
+                remaining = _remaining_seconds(started, request)
+                if remaining <= 0:
+                    if last_error is None:
+                        last_error = ProviderTimeoutError(
+                            "gateway deadline exhausted before provider attempt",
+                            provider=route.provider,
+                        )
+                        last_error_route = route
+                        fallback_count += 1
+                    break
+                circuit_state = await self.circuits.before_request(route.id)
+                self.telemetry.set_circuit_state(route.id, circuit_state.value)
+                attempt_request = request.model_copy(
+                    update={"max_latency_ms": max(1, int(remaining * 1000))}
+                )
+                async with asyncio.timeout(remaining):
+                    result = await self.providers.get(route.provider).complete(
+                        attempt_request, route
+                    )
                 parsed, schema_valid = _validate_schema(request, result.text)
-                await self.circuits.record_success(route.id)
+                circuit_state = await self.circuits.record_success(route.id)
+                self.telemetry.set_circuit_state(route.id, circuit_state.value)
                 response = GatewayResponse(
                     request_id=request.request_id,
                     route_id=route.id,
@@ -152,12 +178,13 @@ class GatewayService:
                         assignment=assignment,
                         shadow=shadow,
                     )
-                if not evaluation and not shadow and request.cache_mode is not CacheMode.BYPASS:
-                    await self.cache.put(request, response)
+                if cache_allowed and request.cache_mode is not CacheMode.BYPASS:
+                    await self.cache.put(request, response, namespace=cache_namespace)
                 self._launch_post_response(request, assignment, shadow)
                 return response
             except SchemaViolationError as exc:
                 last_error = exc
+                last_error_route = route
                 fallback_count += 1
                 self.telemetry.event(
                     "route_schema_failure",
@@ -165,10 +192,41 @@ class GatewayService:
                     route_id=route.id,
                     fallback_count=fallback_count,
                 )
+            except CircuitOpenError as exc:
+                last_error = exc
+                last_error_route = route
+                fallback_count += 1
+                self.telemetry.set_circuit_state(route.id, "open")
+                self.telemetry.event(
+                    "route_circuit_rejected",
+                    request_id=request.request_id,
+                    route_id=route.id,
+                    fallback_count=fallback_count,
+                )
+            except TimeoutError:
+                timeout_error = ProviderTimeoutError(
+                    "provider attempt exceeded the remaining gateway deadline",
+                    provider=route.provider,
+                )
+                last_error = timeout_error
+                last_error_route = route
+                fallback_count += 1
+                circuit_state = await self.circuits.record_failure(route.id)
+                self.telemetry.set_circuit_state(route.id, circuit_state.value)
+                self.telemetry.event(
+                    "route_provider_failure",
+                    request_id=request.request_id,
+                    route_id=route.id,
+                    provider=route.provider,
+                    error_code=timeout_error.code,
+                    fallback_count=fallback_count,
+                )
             except ProviderError as exc:
                 last_error = exc
+                last_error_route = route
                 fallback_count += 1
-                await self.circuits.record_failure(route.id)
+                circuit_state = await self.circuits.record_failure(route.id)
+                self.telemetry.set_circuit_state(route.id, circuit_state.value)
                 self.telemetry.event(
                     "route_provider_failure",
                     request_id=request.request_id,
@@ -181,27 +239,35 @@ class GatewayService:
                     break
 
         assert last_error is not None
+        assert last_error_route is not None
         if not evaluation:
-            route = self.router.get_route(ordered[-1].route_id)
             await self._record_error(
                 request=request,
-                route=route,
+                route=last_error_route,
                 error=last_error,
                 fallback_count=fallback_count,
                 assignment=assignment,
                 shadow=shadow,
                 latency_ms=(monotonic() - started) * 1000,
             )
+            self._launch_release_assessment(assignment)
         raise last_error
 
     async def stream(
         self, request: GatewayRequest, *, forced_route_id: str | None = None
     ) -> AsyncIterator[GatewayStreamEvent]:
-        request = await self._resolve_prompt(request)
         started = monotonic()
+        request = await self._resolve_prompt(request)
         await self.limiter.consume(request.tenant_id)
-        if request.cache_mode is CacheMode.DEFAULT:
-            cached = await self.cache.get(request)
+        assignment = (
+            ReleaseAssignment()
+            if forced_route_id is not None
+            else await self.releases.assignment(request)
+        )
+        cache_namespace = _cache_namespace(assignment, forced_route_id)
+        cache_allowed = not assignment.canary
+        if cache_allowed and request.cache_mode is CacheMode.DEFAULT:
+            cached = await self.cache.get(request, namespace=cache_namespace)
             if cached is not None:
                 elapsed = (monotonic() - started) * 1000
                 cached = cached.model_copy(
@@ -231,9 +297,10 @@ class GatewayService:
                 await self._record_response(
                     request=request,
                     response=cached,
-                    assignment=ReleaseAssignment(),
+                    assignment=assignment,
                     shadow=False,
                 )
+                self._launch_post_response(request, assignment, shadow=False)
                 yield GatewayStreamEvent(
                     type="done",
                     request_id=request.request_id,
@@ -244,11 +311,6 @@ class GatewayService:
                 )
                 return
 
-        assignment = (
-            ReleaseAssignment()
-            if forced_route_id is not None
-            else await self.releases.assignment(request)
-        )
         decision = await self.router.decide(
             request,
             preferred_route_id=assignment.preferred_route_id,
@@ -259,7 +321,7 @@ class GatewayService:
         ordered = _ordered_candidates(decision)
         fallback_count = 0
         last_error: AegisError | None = None
-        self._launch_shadow(request, assignment)
+        last_error_route: ModelRoute | None = None
 
         for candidate in ordered:
             route = self.router.get_route(candidate.route_id)
@@ -270,8 +332,27 @@ class GatewayService:
             output_tokens = 0
             raw_model = route.model
             try:
-                await self.circuits.before_request(route.id)
-                async for event in self.providers.get(route.provider).stream(request, route):
+                remaining = _remaining_seconds(started, request)
+                if remaining <= 0:
+                    if last_error is None:
+                        last_error = ProviderTimeoutError(
+                            "gateway deadline exhausted before provider attempt",
+                            provider=route.provider,
+                        )
+                        last_error_route = route
+                        fallback_count += 1
+                    break
+                circuit_state = await self.circuits.before_request(route.id)
+                self.telemetry.set_circuit_state(route.id, circuit_state.value)
+                attempt_request = request.model_copy(
+                    update={"max_latency_ms": max(1, int(remaining * 1000))}
+                )
+                async for event in _bounded_stream(
+                    self.providers.get(route.provider),
+                    attempt_request,
+                    route,
+                    timeout_seconds=remaining,
+                ):
                     if event.type == "start":
                         yield GatewayStreamEvent(
                             type="start",
@@ -298,7 +379,8 @@ class GatewayService:
                         output_tokens = event.output_tokens or 0
                 text = "".join(text_parts)
                 parsed, schema_valid = _validate_schema(request, text)
-                await self.circuits.record_success(route.id)
+                circuit_state = await self.circuits.record_success(route.id)
+                self.telemetry.set_circuit_state(route.id, circuit_state.value)
                 completed_at = monotonic()
                 response = GatewayResponse(
                     request_id=request.request_id,
@@ -324,9 +406,9 @@ class GatewayService:
                     assignment=assignment,
                     shadow=False,
                 )
-                if request.cache_mode is not CacheMode.BYPASS:
-                    await self.cache.put(request, response)
-                self._launch_release_assessment(assignment)
+                if cache_allowed and request.cache_mode is not CacheMode.BYPASS:
+                    await self.cache.put(request, response, namespace=cache_namespace)
+                self._launch_post_response(request, assignment, shadow=False)
                 yield GatewayStreamEvent(
                     type="done",
                     request_id=request.request_id,
@@ -338,6 +420,7 @@ class GatewayService:
                 return
             except SchemaViolationError as exc:
                 last_error = exc
+                last_error_route = route
                 if emitted:
                     await self._record_error(
                         request=request,
@@ -348,11 +431,50 @@ class GatewayService:
                         shadow=False,
                         latency_ms=(monotonic() - started) * 1000,
                     )
+                    self._launch_release_assessment(assignment)
                     raise
+                fallback_count += 1
+            except CircuitOpenError as exc:
+                last_error = exc
+                last_error_route = route
+                fallback_count += 1
+                self.telemetry.set_circuit_state(route.id, "open")
+                self.telemetry.event(
+                    "route_circuit_rejected",
+                    request_id=request.request_id,
+                    route_id=route.id,
+                    fallback_count=fallback_count,
+                )
+            except TimeoutError:
+                timeout_error = ProviderTimeoutError(
+                    "provider stream exceeded the remaining gateway deadline",
+                    provider=route.provider,
+                )
+                last_error = timeout_error
+                last_error_route = route
+                circuit_state = await self.circuits.record_failure(route.id)
+                self.telemetry.set_circuit_state(route.id, circuit_state.value)
+                if emitted:
+                    interrupted = StreamInterruptedError(
+                        str(timeout_error), provider=route.provider
+                    )
+                    await self._record_error(
+                        request=request,
+                        route=route,
+                        error=interrupted,
+                        fallback_count=fallback_count,
+                        assignment=assignment,
+                        shadow=False,
+                        latency_ms=(monotonic() - started) * 1000,
+                    )
+                    self._launch_release_assessment(assignment)
+                    raise interrupted from timeout_error
                 fallback_count += 1
             except ProviderError as exc:
                 last_error = exc
-                await self.circuits.record_failure(route.id)
+                last_error_route = route
+                circuit_state = await self.circuits.record_failure(route.id)
+                self.telemetry.set_circuit_state(route.id, circuit_state.value)
                 if emitted:
                     interrupted = StreamInterruptedError(str(exc), provider=route.provider)
                     await self._record_error(
@@ -364,22 +486,24 @@ class GatewayService:
                         shadow=False,
                         latency_ms=(monotonic() - started) * 1000,
                     )
+                    self._launch_release_assessment(assignment)
                     raise interrupted from exc
                 fallback_count += 1
                 if exc.code == "invalid_provider_request":
                     break
 
         assert last_error is not None
-        route = self.router.get_route(ordered[-1].route_id)
+        assert last_error_route is not None
         await self._record_error(
             request=request,
-            route=route,
+            route=last_error_route,
             error=last_error,
             fallback_count=fallback_count,
             assignment=assignment,
             shadow=False,
             latency_ms=(monotonic() - started) * 1000,
         )
+        self._launch_release_assessment(assignment)
         raise last_error
 
     async def _resolve_prompt(self, request: GatewayRequest) -> GatewayRequest:
@@ -517,7 +641,32 @@ class GatewayService:
         await self.providers.aclose()
 
 
-def _ordered_candidates(decision: RoutingDecision) -> list[Any]:
+def _cache_namespace(assignment: ReleaseAssignment, forced_route_id: str | None) -> str:
+    if forced_route_id is not None:
+        return f"forced-route:{forced_route_id}"
+    if assignment.release_id is not None:
+        preferred = assignment.preferred_route_id or "policy"
+        return f"release:{assignment.release_id}:route:{preferred}"
+    return "default"
+
+
+def _remaining_seconds(started: float, request: GatewayRequest) -> float:
+    return request.max_latency_ms / 1000 - (monotonic() - started)
+
+
+async def _bounded_stream(
+    adapter: ProviderAdapter,
+    request: GatewayRequest,
+    route: ModelRoute,
+    *,
+    timeout_seconds: float,
+) -> AsyncIterator[ProviderStreamEvent]:
+    async with asyncio.timeout(timeout_seconds):
+        async for event in adapter.stream(request, route):
+            yield event
+
+
+def _ordered_candidates(decision: RoutingDecision) -> list[RoutingCandidate]:
     selected = next(
         candidate
         for candidate in decision.candidates

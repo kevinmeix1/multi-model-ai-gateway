@@ -22,4 +22,5 @@ jobs:
       - run: mypy src
       - run: pytest --cov --cov-branch --cov-report=term-missing
       - run: python scripts/scan_secrets.py
+      - run: python scripts/check_docs.py
       - run: python scripts/run_benchmark.py --requests 25 --concurrency 5 --assert-slo

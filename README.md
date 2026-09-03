@@ -1,55 +1,93 @@
 # Aegis AI Gateway
 
-A production-oriented, policy-first multi-model gateway and evaluation control plane. Aegis routes
-requests across OpenAI, Anthropic, Ollama, and deterministic local adapters only after checking
-capability, privacy, region, context, latency, and cost contracts.
+[![CI](https://github.com/kevinmeix1/multi-model-ai-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/kevinmeix1/multi-model-ai-gateway/actions/workflows/ci.yml)
+[![Python 3.12](https://img.shields.io/badge/python-3.12-3776AB.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
-It is deliberately more than an API wrapper: every routing decision is measurable, every release is
-bound to immutable artifacts, and every fallback is constrained by the original request contract.
+A policy-first multi-model inference gateway with an evaluation and release control plane.
 
-## What it demonstrates
+Aegis routes requests across OpenAI, Anthropic, Ollama, and deterministic local adapters only after
+the route satisfies capability, privacy, region, context, latency, and cost constraints. It adds
+normalized streaming, semantic caching, tenant rate limits, circuit breakers, compatible fallback,
+immutable registries, shadow traffic, deterministic canaries, offline evaluation, and automated
+rollback.
 
-- **Multi-provider data plane:** current OpenAI Responses API, Anthropic Messages API, Ollama Chat
-  API, and a deterministic provider for tests and offline development.
-- **Constraint-first routing:** text, streaming, tools, vision, structured output, data
-  classification, privacy mode, region, context window, p95 latency, and maximum cost.
-- **Production resilience:** per-tenant token buckets, per-route circuit breakers, classified
-  upstream errors, compatible fallback, bounded semantic cache, and mid-stream failure semantics.
-- **Release safety:** immutable prompt/model/dataset/policy artifacts, stable canary assignment,
-  shadow traffic, offline gates, live guardrails, promotion, and automated rollback.
-- **Evaluation evidence:** schema compliance, task quality, TTFT, p99 latency, cost per successful
-  request, routing regret, failover success, and rollback latency.
-- **Operability:** Prometheus metrics, structured event logs, SQLite evidence ledger, health checks,
-  a small control-plane console, Docker, Kubernetes, and CI.
+This repository is an executable single-process reference. It runs end to end on a laptop without
+provider credentials and documents the state/services that must change before multi-replica or public
+deployment.
+
+## Why it exists
+
+Choosing a model because its endpoint is up is not enough. The same application may handle an
+EU-restricted document, a public low-cost summary, a long-context coding task, and a latency-critical
+structured response. Those requests do not have the same eligible provider set.
+
+Aegis treats routing as constrained optimization:
+
+```text
+request contract
+    -> hard eligibility filters
+    -> utility ranking inside the feasible set
+    -> provider attempt
+    -> schema and evidence checks
+    -> constrained fallback or typed failure
+```
+
+Canary preference and fallback cannot weaken hard policy. Once streamed content is exposed, the
+gateway never silently changes models.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    C[Client] --> A[FastAPI data plane]
-    A --> P[Prompt registry]
-    P --> L[Rate limiter]
-    L --> K{Semantic cache}
-    K -- miss --> R[Policy router]
-    R --> B[Circuit breakers]
-    B --> O[OpenAI Responses]
-    B --> H[Anthropic Messages]
-    B --> M[Ollama local]
-    B --> D[Deterministic adapter]
-    R -. shadow .-> S[Candidate route]
-    O & H & M & D & S --> E[Evidence ledger]
-    E --> G[Evaluation and release gates]
-    G -->|promote / rollback| R
+    Client[Native or compatible client] --> API[FastAPI boundary]
+    API --> Prompt[Immutable prompt resolver]
+    Prompt --> Limit[Tenant token bucket]
+    Limit --> Release[Release assignment]
+    Release --> Cache{Release- and policy-scoped semantic cache}
+    Cache -->|miss or bypass| Router[Constraint-first router]
+    Router --> Circuit[Route circuit breaker]
+    Circuit --> Adapter[Provider adapter]
+    Adapter --> OpenAI[OpenAI Responses]
+    Adapter --> Anthropic[Anthropic Messages]
+    Adapter --> Ollama[Ollama chat]
+    Adapter --> Mock[Deterministic local]
+    OpenAI & Anthropic & Ollama & Mock --> Schema[JSON Schema validation]
+    Schema --> Evidence[(Evidence ledger)]
+    Cache -->|hit| Evidence
+    Evidence --> Guard[Evaluation and release guard]
+    Guard -->|promote / rollback| Release
 ```
 
-The detailed topology, data contracts, and failure semantics are in
-[docs/architecture.md](docs/architecture.md).
+The main design rules are documented as
+[architecture decision records](docs/decisions/README.md), not left implicit in code.
+
+## What is implemented
+
+- Native `POST /v1/generate` and a narrow OpenAI-compatible `POST /v1/chat/completions` API.
+- Current OpenAI Responses, Anthropic Messages, Ollama Chat, and deterministic adapters.
+- Complete-response and normalized SSE/NDJSON streaming paths.
+- Capability, privacy, region, context, p95 latency, worst-case cost, circuit, and enabled-state
+  filters.
+- Explicit quality/latency/cost utility with measurable routing regret.
+- Per-tenant token buckets and one-probe half-open circuit breakers.
+- Fallback only among routes that satisfy the original request contract.
+- Bounded tenant/policy/release-scoped semantic cache with TTL and LRU eviction.
+- Immutable prompt, dataset, model-catalogue, and policy artifacts.
+- Stable request-hash canaries, shadow traffic, offline gates, promotion, and rollback.
+- Schema compliance, TTFT, p99, cost per success, failover success, regret, and rollback evidence.
+- SQLite evidence ledger, Prometheus endpoint, and structured completion logs.
+- Docker, Compose, Kubernetes reference manifests, and GitHub Actions CI.
+- 60 deterministic tests with enforced branch coverage, type checking, linting, secret scan, and
+  concurrency benchmark.
 
 ## Quick start
 
-Requirements: Python 3.12+.
+Requirements: Python 3.12 or later.
 
 ```bash
+git clone https://github.com/kevinmeix1/multi-model-ai-gateway.git
+cd multi-model-ai-gateway
 python3.12 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e '.[dev]'
@@ -58,128 +96,181 @@ python scripts/seed_demo.py
 aegis --reload
 ```
 
-The deterministic routes are enabled by default, so the complete system runs without credentials or
-network access. Open <http://127.0.0.1:8000/docs> for the API and
-<http://127.0.0.1:8000/console> for the control-plane view.
+The deterministic routes are enabled by default. No API key or network call is needed. Open:
 
-Generate a response:
+- API documentation: <http://127.0.0.1:8000/docs>
+- small control-plane view: <http://127.0.0.1:8000/console>
+- Prometheus metrics: <http://127.0.0.1:8000/metrics>
+
+Generate:
 
 ```bash
-curl -s http://127.0.0.1:8000/v1/generate \
+curl -sS http://127.0.0.1:8000/v1/generate \
   -H 'Content-Type: application/json' \
   -d '{
-    "tenant_id": "demo",
-    "messages": [{"role": "user", "content": "Explain circuit breakers briefly."}],
-    "max_cost_usd": 0.02,
-    "max_latency_ms": 5000
+    "tenant_id":"demo",
+    "messages":[{"role":"user","content":"Explain circuit breakers briefly."}],
+    "max_cost_usd":0.02,
+    "max_latency_ms":5000
   }'
 ```
 
-Stream normalized SSE events:
+Stream:
 
 ```bash
 curl -N http://127.0.0.1:8000/v1/generate \
   -H 'Content-Type: application/json' \
   -d '{
-    "tenant_id": "demo",
-    "stream": true,
-    "messages": [{"role": "user", "content": "Stream this response."}]
+    "tenant_id":"demo",
+    "stream":true,
+    "messages":[{"role":"user","content":"Explain routing regret."}]
   }'
 ```
 
-Use the OpenAI-compatible surface:
+Use the compatibility surface:
 
 ```bash
-curl -s http://127.0.0.1:8000/v1/chat/completions \
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'X-Aegis-Tenant: demo' \
   -d '{"model":"auto","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
+## Routing contract
+
+For route `r`, input estimate `T_in`, and maximum output `T_out,max`, predicted cost is:
+
+\[
+\hat{C}(r)=
+\frac{T_{in}P_{in}(r)+T_{out,max}P_{out}(r)}{10^6}
+\]
+
+Only routes whose predicted cost is inside the request budget enter the feasible set. Eligible routes
+are ranked by:
+
+\[
+U(r)=0.55Q(r)
+-0.25\min\left(1,\frac{L_{p95}(r)}{L_{max}}\right)
+-0.20\min\left(1,\frac{\hat{C}(r)}{C_{max}}\right)
+\]
+
+The weights are inspectable policy, not learned truth. See [Routing policy](docs/routing-policy.md)
+for the full predicate, worked example, tie-breaking, and regret definition.
+
+## Privacy behavior
+
+| Data classification | Minimum route privacy |
+|---|---|
+| Public or internal | Caller-requested mode |
+| Confidential with standard request | Zero-retention |
+| Restricted | Local-only |
+
+Allowed regions must intersect route regions. `global` is not a wildcard. These constraints apply to
+normal choice, forced routes, canaries, and fallback.
+
 ## Enabling real providers
 
 Credentials are read only from environment variables. Never place keys in `configs/models.yaml`.
 
-1. Export `OPENAI_API_KEY` and/or `ANTHROPIC_API_KEY`.
-2. Set the corresponding route's `enabled` field to `true` in `configs/models.yaml`.
-3. Replace example model identifiers and prices with values verified for your account and region.
-4. Run a small evaluation before creating a canary release.
+1. Export `OPENAI_API_KEY` and/or `ANTHROPIC_API_KEY` outside source control.
+2. Verify account access, model identifier, region, privacy terms, context, and current price.
+3. Update the corresponding disabled route in `configs/models.yaml`.
+4. Run a small forced evaluation before allowing automatic routing.
+5. Create a draft release, observe shadow traffic, then start a bounded canary.
 
 The OpenAI adapter follows the official
 [Responses streaming contract](https://developers.openai.com/api/docs/guides/streaming-responses)
-and `text.format` JSON Schema contract. The Anthropic adapter follows the
-[Messages streaming contract](https://platform.claude.com/docs/en/build-with-claude/streaming)
-and `output_config.format` structured-output contract. Ollama uses its documented
-[`/api/chat`](https://docs.ollama.com/api/chat) NDJSON interface.
+and [Structured Outputs contract](https://developers.openai.com/api/docs/guides/structured-outputs).
+The Anthropic and Ollama mappings are linked from the
+[provider adapter guide](docs/provider-adapters.md).
 
-## Release workflow
+Prices and model IDs in the example catalogue are configuration examples, not current pricing or an
+availability claim.
 
-```text
-register prompt/dataset/model artifacts
-                 |
-             offline eval
-                 |
-       deterministic release gate
-                 |
-          shadow + 5% canary
-                 |
-       live p99/error/schema checks
-          /                  \
-      promote           auto rollback
+## Release path
+
+```mermaid
+flowchart LR
+    Artifacts[Versioned artifacts] --> Eval[Baseline and candidate evaluation]
+    Eval --> Gate{Offline gate}
+    Gate -->|fail| Stop[Keep draft]
+    Gate -->|pass| Shadow[Shadow traffic]
+    Shadow --> Canary[Stable canary cohort]
+    Canary --> Live{Live error/schema/p99 guard}
+    Live -->|healthy| Promote[Explicit promotion]
+    Live -->|breach| Rollback[Automatic rollback]
 ```
 
-`scripts/seed_demo.py` creates an immutable evaluation dataset and a draft release. Control-plane
-routes require `Authorization: Bearer $AEGIS_ADMIN_TOKEN`.
+`scripts/seed_demo.py` registers a small prompt, dataset, and draft release. It demonstrates the
+mechanics; it is not a meaningful model benchmark.
 
-Run the deterministic benchmark:
+## Validation
 
-```bash
-python scripts/run_benchmark.py --requests 250 --concurrency 25
-```
-
-## Quality gates
+Run the same checks as CI:
 
 ```bash
 make check
 ```
 
-This runs Ruff, strict mypy, tests with branch coverage, a credential-pattern scan, and the local
-benchmark smoke test. See [docs/evaluation.md](docs/evaluation.md) for metric definitions and
-[docs/operations.md](docs/operations.md) for incident procedures.
+The current suite contains 60 passing tests and enforces 95%+ branch-aware coverage. The local
+250-request, 25-worker benchmark completed with 100% success, 13.3 ms p99, and approximately 919
+requests/second on the build machine. Those numbers measure the deterministic local path and should
+not be generalized to hosted provider latency.
 
-## Security posture
+## Engineering handbook
 
-- Cache identity includes tenant, data classification, privacy mode, schema, capabilities, prompt
-  reference, and output budget.
-- Confidential requests implicitly require zero-retention or local routes; restricted data requires
-  local-only routes.
-- Provider credentials are secret settings and never appear in route catalogs, responses, metrics,
-  or logs.
-- Fallback happens only among routes that independently satisfy the original contract.
-- Once streaming output is exposed, Aegis reports interruption rather than silently switching models.
+Start with the [handbook index](docs/index.md), or go directly to a topic:
 
-The demo data plane intentionally relies on an upstream identity layer. Before internet exposure,
-follow the hardening checklist in [docs/security.md](docs/security.md).
+| Area | Guide |
+|---|---|
+| Boundaries, components, state, scaling | [Architecture and invariants](docs/architecture.md) |
+| Complete, streaming, fallback, shadow paths | [Request lifecycle](docs/request-lifecycle.md) |
+| Constraints, utility, cost, regret | [Routing policy](docs/routing-policy.md) |
+| OpenAI, Anthropic, Ollama contracts | [Provider adapters](docs/provider-adapters.md) |
+| Cache scope, hashing, similarity, threats | [Semantic cache](docs/semantic-cache.md) |
+| Limits, circuits, fallback, deadlines | [Reliability model](docs/reliability.md) |
+| Pydantic models, SQLite schema, migrations | [Data model](docs/data-model.md) |
+| Datasets, scoring, gates, statistics | [Evaluation](docs/evaluation.md) |
+| Shadow, canary, promotion, rollback | [Release engineering](docs/release-engineering.md) |
+| Metrics, logs, dashboards, tracing | [Observability](docs/observability.md) |
+| Threats, controls, hardening | [Security](docs/security.md) |
+| Latency, queueing, provider/local cost | [Performance and cost](docs/performance-and-cost.md) |
+| Local, Docker, Kubernetes, scaling | [Deployment](docs/deployment.md) |
+| Incident diagnosis and recovery | [Operations runbook](docs/operations.md) |
+| Test layers and fault injection | [Test strategy](docs/testing.md) |
+| HTTP and SSE contracts | [API reference](docs/api-reference.md) |
+| Decision rationale | [Architecture decisions](docs/decisions/README.md) |
 
 ## Repository map
 
 ```text
-src/aegis_gateway/providers/  OpenAI, Anthropic, Ollama, and mock adapters
-src/aegis_gateway/control/    routing, cache, resilience, registry, eval, releases
-src/aegis_gateway/api/        native and OpenAI-compatible HTTP/SSE APIs
-configs/                      model-route catalog
-tests/                        unit, adapter-contract, API, and release tests
-scripts/                      seeding, benchmark, and repository validation
-deploy/kubernetes/            deployment, service, configuration, and network policy
-docs/                         architecture, evaluation, security, and runbooks
+src/aegis_gateway/api/          HTTP, compatibility, SSE, control plane
+src/aegis_gateway/control/      routing, cache, resilience, registry, eval, releases
+src/aegis_gateway/providers/    OpenAI, Anthropic, Ollama, deterministic adapters
+configs/                        route catalogue
+tests/                          unit, integration, provider-contract, API tests
+scripts/                        seed, benchmark, secret and documentation checks
+deploy/kubernetes/              single-replica reference manifests
+docs/                           engineering handbook and ADRs
 ```
 
 ## Honest scope
 
-SQLite and the in-process limiter/cache make the repository reproducible on one laptop. A
-multi-replica deployment should replace them with transactional PostgreSQL, Redis-backed distributed
-rate limiting/cache, and a durable event bus. The interfaces and failure semantics are designed so
-those substitutions do not change the public request contract.
+SQLite and in-process limiter/cache/circuits make the full system reproducible on one machine. Do not
+scale the Kubernetes replica count and assume those controls become distributed. A multi-replica
+deployment needs PostgreSQL, atomic distributed quotas, a policy-partitioned shared cache if desired,
+a durable evidence stream, trusted ingress identity, scoped control-plane authorization, and tested
+egress controls.
+
+Tool and vision capabilities are represented in route policy but do not yet have normalized public
+payload contracts. Automated rollback uses threshold rules, not statistical causal inference.
+
+Those limits are detailed in the handbook rather than hidden behind a "production-ready" label.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for design rules and test expectations. Report vulnerabilities
+privately as described in [SECURITY.md](SECURITY.md).
 
 ## License
 

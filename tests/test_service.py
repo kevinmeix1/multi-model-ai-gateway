@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
+from time import monotonic
 from typing import Any
 
 import pytest
@@ -15,8 +16,14 @@ from aegis_gateway.domain import (
     ProviderResult,
     ProviderStreamEvent,
     Release,
+    ReleaseState,
 )
-from aegis_gateway.errors import ProviderError, SchemaViolationError, StreamInterruptedError
+from aegis_gateway.errors import (
+    ProviderError,
+    ProviderTimeoutError,
+    SchemaViolationError,
+    StreamInterruptedError,
+)
 from aegis_gateway.providers.mock import MockAdapter
 from aegis_gateway.runtime import Runtime
 
@@ -331,3 +338,172 @@ async def test_shadow_traffic_is_isolated_and_recorded(
     assert len(metrics) == 2
     assert {item.shadow for item in metrics} == {False, True}
     assert next(item for item in metrics if item.shadow).request_id.endswith("-shadow")
+
+
+async def test_cache_isolated_by_forced_route_and_release_lane(
+    runtime: Runtime,
+    request_factory: Callable[..., GatewayRequest],
+) -> None:
+    baseline = await runtime.service.generate(request_factory())
+    assert baseline.route_id == "mock-primary"
+
+    forced = await runtime.service.generate(
+        request_factory(request_id="request-forced-1"),
+        forced_route_id="mock-canary",
+    )
+    forced_cached = await runtime.service.generate(
+        request_factory(request_id="request-forced-2"),
+        forced_route_id="mock-canary",
+    )
+    assert forced.route_id == "mock-canary"
+    assert forced.cache_hit is False
+    assert forced_cached.cache_hit is True
+    assert mock(runtime).calls == 2
+
+    release = await runtime.release_registry.create(
+        Release(
+            id="cache-isolation-release",
+            name="default",
+            baseline_route_id="mock-primary",
+            candidate_route_id="mock-canary",
+            canary_percent=100,
+            min_canary_samples=20,
+        )
+    )
+    await runtime.release_manager.start_canary(release.id)
+    first_canary = await runtime.service.generate(request_factory(request_id="request-canary-1"))
+    second_canary = await runtime.service.generate(request_factory(request_id="request-canary-2"))
+    assert first_canary.route_id == "mock-canary"
+    assert first_canary.cache_hit is False
+    assert second_canary.cache_hit is False
+    assert mock(runtime).calls == 4
+
+    await runtime.release_manager.promote(release.id)
+    active = await runtime.service.generate(request_factory(request_id="request-active-1"))
+    active_cached = await runtime.service.generate(request_factory(request_id="request-active-2"))
+    assert active.route_id == "mock-canary"
+    assert active.cache_hit is False
+    assert active_cached.cache_hit is True
+    assert mock(runtime).calls == 5
+
+
+async def test_circuit_race_falls_back_and_updates_prometheus(
+    runtime: Runtime,
+    request_factory: Callable[..., GatewayRequest],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = runtime.service.circuits.before_request
+    raced = False
+
+    async def open_after_routing(route_id: str):  # type: ignore[no-untyped-def]
+        nonlocal raced
+        if route_id == "mock-primary" and not raced:
+            raced = True
+            for _ in range(3):
+                await runtime.service.circuits.record_failure(route_id)
+        return await original(route_id)
+
+    monkeypatch.setattr(runtime.service.circuits, "before_request", open_after_routing)
+    response = await runtime.service.generate(request_factory(cache_mode=CacheMode.BYPASS))
+    assert response.route_id == "mock-canary"
+    assert response.fallback_count == 1
+    assert mock(runtime).calls == 1
+    metrics = runtime.service.telemetry.render_prometheus()
+    assert b'aegis_circuit_state{route="mock-primary"} 2.0' in metrics
+
+
+async def test_total_deadline_bounds_complete_and_preserves_attempt_evidence(
+    runtime: Runtime,
+    request_factory: Callable[..., GatewayRequest],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempted: list[str] = []
+
+    async def slow_complete(_request: GatewayRequest, route: ModelRoute) -> ProviderResult:
+        attempted.append(route.id)
+        await asyncio.sleep(0.2)
+        raise AssertionError("gateway deadline did not cancel the provider")
+
+    monkeypatch.setattr(mock(runtime), "complete", slow_complete)
+    started = monotonic()
+    with pytest.raises(ProviderTimeoutError):
+        await runtime.service.generate(
+            request_factory(max_latency_ms=50, cache_mode=CacheMode.BYPASS)
+        )
+    assert monotonic() - started < 0.15
+    assert attempted == ["mock-primary"]
+    evidence = await runtime.evidence.metrics(limit=1)
+    assert evidence[0].route_id == "mock-primary"
+    assert evidence[0].error_code == "provider_timeout"
+
+
+async def test_total_deadline_bounds_stream_before_first_output(
+    runtime: Runtime,
+    request_factory: Callable[..., GatewayRequest],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempted: list[str] = []
+
+    async def slow_stream(
+        _request: GatewayRequest, route: ModelRoute
+    ) -> AsyncIterator[ProviderStreamEvent]:
+        attempted.append(route.id)
+        await asyncio.sleep(0.2)
+        yield ProviderStreamEvent(type="start")
+
+    monkeypatch.setattr(mock(runtime), "stream", slow_stream)
+    started = monotonic()
+    with pytest.raises(ProviderTimeoutError):
+        _ = [
+            event
+            async for event in runtime.service.stream(
+                request_factory(
+                    stream=True,
+                    max_latency_ms=50,
+                    cache_mode=CacheMode.BYPASS,
+                )
+            )
+        ]
+    assert monotonic() - started < 0.15
+    assert attempted == ["mock-primary"]
+    evidence = await runtime.evidence.metrics(limit=1)
+    assert evidence[0].route_id == "mock-primary"
+    assert evidence[0].error_code == "provider_timeout"
+
+
+async def test_terminal_canary_failure_triggers_automatic_rollback(
+    runtime: Runtime,
+    request_factory: Callable[..., GatewayRequest],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = await runtime.release_registry.create(
+        Release(
+            id="failing-canary-release",
+            name="default",
+            baseline_route_id="mock-primary",
+            candidate_route_id="mock-canary",
+            canary_percent=100,
+            min_canary_samples=1,
+            max_error_rate=0,
+        )
+    )
+    await runtime.release_manager.start_canary(release.id)
+
+    async def reject(_request: GatewayRequest, _route: ModelRoute) -> ProviderResult:
+        raise ProviderError(
+            "candidate rejected the request",
+            provider="mock",
+            retryable=False,
+            code="invalid_provider_request",
+        )
+
+    monkeypatch.setattr(mock(runtime), "complete", reject)
+    with pytest.raises(ProviderError):
+        await runtime.service.generate(request_factory(cache_mode=CacheMode.BYPASS))
+    await asyncio.gather(*list(runtime.service._background))
+    stored = await runtime.release_registry.get(release.id)
+    assert stored.state is ReleaseState.ROLLED_BACK
+    evidence = await runtime.evidence.metrics(release_id=release.id)
+    assert len(evidence) == 1
+    assert evidence[0].canary is True
+    assert evidence[0].success is False

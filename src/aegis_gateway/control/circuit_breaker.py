@@ -57,7 +57,7 @@ class CircuitBreakers:
                 circuit.state is CircuitState.HALF_OPEN and not circuit.probe_in_flight
             )
 
-    async def before_request(self, route_id: str) -> None:
+    async def before_request(self, route_id: str) -> CircuitState:
         async with self._lock:
             circuit = self._circuits.setdefault(route_id, _Circuit())
             self._advance(circuit)
@@ -67,16 +67,18 @@ class CircuitBreakers:
                 if circuit.probe_in_flight:
                     raise CircuitOpenError(f"circuit for route '{route_id}' has a probe in flight")
                 circuit.probe_in_flight = True
+            return circuit.state
 
-    async def record_success(self, route_id: str) -> None:
+    async def record_success(self, route_id: str) -> CircuitState:
         async with self._lock:
             circuit = self._circuits.setdefault(route_id, _Circuit())
             circuit.state = CircuitState.CLOSED
             circuit.consecutive_failures = 0
             circuit.opened_at = None
             circuit.probe_in_flight = False
+            return circuit.state
 
-    async def record_failure(self, route_id: str) -> None:
+    async def record_failure(self, route_id: str) -> CircuitState:
         async with self._lock:
             circuit = self._circuits.setdefault(route_id, _Circuit())
             circuit.probe_in_flight = False
@@ -87,6 +89,7 @@ class CircuitBreakers:
             ):
                 circuit.state = CircuitState.OPEN
                 circuit.opened_at = self._clock()
+            return circuit.state
 
     async def snapshots(self) -> list[CircuitSnapshot]:
         async with self._lock:

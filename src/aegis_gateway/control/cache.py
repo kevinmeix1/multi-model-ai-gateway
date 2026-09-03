@@ -72,8 +72,10 @@ class SemanticCache:
         self._entries: OrderedDict[str, _Entry] = OrderedDict()
         self._lock = asyncio.Lock()
 
-    async def get(self, request: GatewayRequest) -> GatewayResponse | None:
-        scope, fingerprint, text = _identity(request)
+    async def get(
+        self, request: GatewayRequest, *, namespace: str = "default"
+    ) -> GatewayResponse | None:
+        scope, fingerprint, text = _identity(request, namespace=namespace)
         vector = self._embedder.embed(text)
         now = self._clock()
         async with self._lock:
@@ -96,8 +98,14 @@ class SemanticCache:
             self._entries.move_to_end(best_key)
             return self._entries[best_key].response.model_copy(update={"cache_hit": True})
 
-    async def put(self, request: GatewayRequest, response: GatewayResponse) -> None:
-        scope, fingerprint, text = _identity(request)
+    async def put(
+        self,
+        request: GatewayRequest,
+        response: GatewayResponse,
+        *,
+        namespace: str = "default",
+    ) -> None:
+        scope, fingerprint, text = _identity(request, namespace=namespace)
         entry = _Entry(
             scope=scope,
             fingerprint=fingerprint,
@@ -128,11 +136,12 @@ class SemanticCache:
             self._entries.pop(key, None)
 
 
-def _identity(request: GatewayRequest) -> tuple[str, str, str]:
+def _identity(request: GatewayRequest, *, namespace: str) -> tuple[str, str, str]:
     schema_hash = sha256(
         json.dumps(request.response_schema, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     scope_data = {
+        "namespace": namespace,
         "tenant": request.tenant_id,
         "classification": request.data_classification,
         "privacy": request.privacy_mode,
